@@ -1330,7 +1330,8 @@ char *sendSynchronousCommand(int flags, int fd, ...) {
             cmd = sdscat(cmd,arg);
         }
         cmd = sdscatlen(cmd,"\r\n",2);
-
+        va_end(ap);
+        
         /* Transfer command to the server. */
         if (syncWrite(fd,cmd,sdslen(cmd),server.repl_syncio_timeout*1000)
             == -1)
@@ -1340,7 +1341,6 @@ char *sendSynchronousCommand(int flags, int fd, ...) {
                     strerror(errno));
         }
         sdsfree(cmd);
-        va_end(ap);
     }
 
     /* Read the reply from the server. */
@@ -1970,6 +1970,12 @@ void replicationUnsetMaster(void) {
      * with PSYNC version 2, there is no need for full resync after a
      * master switch. */
     server.slaveseldb = -1;
+
+    /* Once we turn from slave to master, we consider the starting time without
+     * slaves (that is used to count the replication backlog time to live) as
+     * starting from now. Otherwise the backlog will be freed after a
+     * failover if slaves do not connect immediately. */
+    server.repl_no_slaves_since = server.unixtime;
 }
 
 /* This function is called when the slave lose the connection with the
@@ -2205,7 +2211,7 @@ void replicationResurrectCachedMaster(int newfd) {
     server.repl_state = REPL_STATE_CONNECTED;
 
     /* Re-add to the list of clients. */
-    listAddNodeTail(server.clients,server.master);
+    linkClient(server.master);
     if (aeCreateFileEvent(server.el, newfd, AE_READABLE,
                           readQueryFromClient, server.master)) {
         serverLog(LL_WARNING,"Error resurrecting the cached master, impossible to add the readable handler: %s", strerror(errno));
@@ -2613,6 +2619,23 @@ void replicationCron(void) {
         time_t idle = server.unixtime - server.repl_no_slaves_since;
 
         if (idle > server.repl_backlog_time_limit) {
+            /* When we free the backlog, we always use a new
+             * replication ID and clear the ID2. This is needed
+             * because when there is no backlog, the master_repl_offset
+             * is not updated, but we would still retain our replication
+             * ID, leading to the following problem:
+             *
+             * 1. We are a master instance.
+             * 2. Our slave is promoted to master. It's repl-id-2 will
+             *    be the same as our repl-id.
+             * 3. We, yet as master, receive some updates, that will not
+             *    increment the master_repl_offset.
+             * 4. Later we are turned into a slave, connecto to the new
+             *    master that will accept our PSYNC request by second
+             *    replication ID, but there will be data inconsistency
+             *    because we received writes. */
+            changeReplicationId();
+            clearReplicationId2();
             freeReplicationBacklog();
             serverLog(LL_NOTICE,
                 "Replication backlog freed after %d seconds "

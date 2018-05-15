@@ -139,7 +139,7 @@ typedef long long mstime_t; /* millisecond time type. */
 #define CONFIG_DEFAULT_AOF_FILENAME "appendonly.aof"
 #define CONFIG_DEFAULT_AOF_NO_FSYNC_ON_REWRITE 0
 #define CONFIG_DEFAULT_AOF_LOAD_TRUNCATED 1
-#define CONFIG_DEFAULT_AOF_USE_RDB_PREAMBLE 0
+#define CONFIG_DEFAULT_AOF_USE_RDB_PREAMBLE 1
 #define CONFIG_DEFAULT_ACTIVE_REHASHING 1
 #define CONFIG_DEFAULT_AOF_REWRITE_INCREMENTAL_FSYNC 1
 #define CONFIG_DEFAULT_MIN_SLAVES_TO_WRITE 0
@@ -158,8 +158,10 @@ typedef long long mstime_t; /* millisecond time type. */
 #define CONFIG_DEFAULT_DEFRAG_THRESHOLD_LOWER 10 /* don't defrag when fragmentation is below 10% */
 #define CONFIG_DEFAULT_DEFRAG_THRESHOLD_UPPER 100 /* maximum defrag force at 100% fragmentation */
 #define CONFIG_DEFAULT_DEFRAG_IGNORE_BYTES (100<<20) /* don't defrag if frag overhead is below 100mb */
-#define CONFIG_DEFAULT_DEFRAG_CYCLE_MIN 25 /* 25% CPU min (at lower threshold) */
+#define CONFIG_DEFAULT_DEFRAG_CYCLE_MIN 5 /* 5% CPU min (at lower threshold) */
 #define CONFIG_DEFAULT_DEFRAG_CYCLE_MAX 75 /* 75% CPU max (at upper threshold) */
+#define CONFIG_DEFAULT_DEFRAG_MAX_SCAN_FIELDS 1000 /* keys with more than 1000 fields will be processed separately */
+#define CONFIG_DEFAULT_PROTO_MAX_BULK_LEN (512ll*1024*1024) /* Bulk request max size */
 
 #define ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP 20 /* Loopkups per loop. */
 #define ACTIVE_EXPIRE_CYCLE_FAST_DURATION 1000 /* Microseconds */
@@ -255,6 +257,8 @@ typedef long long mstime_t; /* millisecond time type. */
 #define BLOCKED_LIST 1    /* BLPOP & co. */
 #define BLOCKED_WAIT 2    /* WAIT for synchronous replication. */
 #define BLOCKED_MODULE 3  /* Blocked by a loadable module. */
+#define BLOCKED_STREAM 4  /* XREAD. */
+#define BLOCKED_NUM 5     /* Number of blocked states. */
 
 /* Client request types */
 #define PROTO_REQ_INLINE 1
@@ -424,7 +428,8 @@ typedef long long mstime_t; /* millisecond time type. */
 #define NOTIFY_ZSET (1<<7)        /* z */
 #define NOTIFY_EXPIRED (1<<8)     /* x */
 #define NOTIFY_EVICTED (1<<9)     /* e */
-#define NOTIFY_ALL (NOTIFY_GENERIC | NOTIFY_STRING | NOTIFY_LIST | NOTIFY_SET | NOTIFY_HASH | NOTIFY_ZSET | NOTIFY_EXPIRED | NOTIFY_EVICTED)      /* A */
+#define NOTIFY_STREAM (1<<10)     /* t */
+#define NOTIFY_ALL (NOTIFY_GENERIC | NOTIFY_STRING | NOTIFY_LIST | NOTIFY_SET | NOTIFY_HASH | NOTIFY_ZSET | NOTIFY_EXPIRED | NOTIFY_EVICTED | NOTIFY_STREAM) /* A flag */
 
 /* Get the first bind addr or NULL */
 #define NET_FIRST_BIND_ADDR (server.bindaddr_count ? server.bindaddr[0] : NULL)
@@ -446,11 +451,11 @@ typedef long long mstime_t; /* millisecond time type. */
 /* A redis object, that is a type able to hold a string / list / set */
 
 /* The actual Redis Object */
-#define OBJ_STRING 0
-#define OBJ_LIST 1
-#define OBJ_SET 2
-#define OBJ_ZSET 3
-#define OBJ_HASH 4
+#define OBJ_STRING 0    /* String object. */
+#define OBJ_LIST 1      /* List object. */
+#define OBJ_SET 2       /* Set object. */
+#define OBJ_ZSET 3      /* Sorted set object. */
+#define OBJ_HASH 4      /* Hash object. */
 
 /* The "module" object type is a special one that signals that the object
  * is one directly managed by a Redis module. In this case the value points
@@ -463,7 +468,8 @@ typedef long long mstime_t; /* millisecond time type. */
  * by a 64 bit module type ID, which has a 54 bits module-specific signature
  * in order to dispatch the loading to the right module, plus a 10 bits
  * encoding version. */
-#define OBJ_MODULE 5
+#define OBJ_MODULE 5    /* Module object. */
+#define OBJ_STREAM 6    /* Stream object. */
 
 /* Extract encver / signature from a module type ID. */
 #define REDISMODULE_TYPE_ENCVER_BITS 10
@@ -575,6 +581,7 @@ typedef struct RedisModuleDigest {
 #define OBJ_ENCODING_SKIPLIST 7  /* Encoded as skiplist */
 #define OBJ_ENCODING_EMBSTR 8  /* Embedded sds string encoding */
 #define OBJ_ENCODING_QUICKLIST 9 /* Encoded as linked list of ziplists */
+#define OBJ_ENCODING_STREAM 10 /* Encoded as a radix tree of listpacks */
 
 #define LRU_BITS 24
 #define LRU_CLOCK_MAX ((1<<LRU_BITS)-1) /* Max value of obj->lru */
@@ -586,7 +593,7 @@ typedef struct redisObject {
     unsigned encoding:4;
     unsigned lru:LRU_BITS; /* LRU time (relative to global lru_clock) or
                             * LFU data (least significant 8 bits frequency
-                            * and most significant 16 bits decreas time). */
+                            * and most significant 16 bits access time). */
     int refcount;
     void *ptr;
 } robj;
@@ -615,6 +622,7 @@ typedef struct redisDb {
     dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
     int id;                     /* Database ID */
     long long avg_ttl;          /* Average TTL, just for stats */
+    list *defrag_later;         /* List of key names to attempt to defrag one by one, gradually. */
 } redisDb;
 
 /* Client MULTI/EXEC state */
@@ -638,11 +646,17 @@ typedef struct blockingState {
     mstime_t timeout;       /* Blocking operation timeout. If UNIX current time
                              * is > timeout then the operation timed out. */
 
-    /* BLOCKED_LIST */
+    /* BLOCKED_LIST and BLOCKED_STREAM */
     dict *keys;             /* The keys we are waiting to terminate a blocking
-                             * operation such as BLPOP. Otherwise NULL. */
+                             * operation such as BLPOP or XREAD. Or NULL. */
     robj *target;           /* The key that should receive the element,
                              * for BRPOPLPUSH. */
+
+    /* BLOCK_STREAM */
+    size_t xread_count;     /* XREAD COUNT option. */
+    robj *xread_group;      /* XREADGROUP group name. */
+    robj *xread_consumer;   /* XREADGROUP consumer name. */
+    mstime_t xread_retry_time, xread_retry_ttl;
 
     /* BLOCKED_WAIT */
     int numreplicas;        /* Number of replicas we are waiting for ACK. */
@@ -722,6 +736,7 @@ typedef struct client {
     dict *pubsub_channels;  /* channels a client is interested in (SUBSCRIBE) */
     list *pubsub_patterns;  /* patterns a client is interested in (SUBSCRIBE) */
     sds peerid;             /* Cached peer ID. */
+    listNode *client_list_node; /* list node in client list */
 
     /* Response buffer */
     int bufpos;
@@ -825,7 +840,14 @@ struct redisMemOverhead {
     size_t bytes_per_key;
     float dataset_perc;
     float peak_perc;
-    float fragmentation;
+    float total_frag;
+    size_t total_frag_bytes;
+    float allocator_frag;
+    size_t allocator_frag_bytes;
+    float allocator_rss;
+    size_t allocator_rss_bytes;
+    float rss_extra;
+    size_t rss_extra_bytes;
     size_t num_dbs;
     struct {
         size_t dbid;
@@ -853,6 +875,14 @@ typedef struct rdbSaveInfo {
 } rdbSaveInfo;
 
 #define RDB_SAVE_INFO_INIT {-1,0,"000000000000000000000000000000",-1}
+
+typedef struct malloc_stats {
+    size_t zmalloc_used;
+    size_t process_rss;
+    size_t allocator_allocated;
+    size_t allocator_active;
+    size_t allocator_resident;
+} malloc_stats;
 
 /*-----------------------------------------------------------------------------
  * Global server state
@@ -930,13 +960,15 @@ struct redisServer {
     off_t loading_process_events_interval_bytes;
     /* Fast pointers to often looked up command */
     struct redisCommand *delCommand, *multiCommand, *lpushCommand, *lpopCommand,
-                        *rpopCommand, *sremCommand, *execCommand, *expireCommand,
-                        *pexpireCommand;
+                        *rpopCommand, *sremCommand, *execCommand,
+                        *expireCommand, *pexpireCommand, *xclaimCommand;
     /* Fields used only for stats */
     time_t stat_starttime;          /* Server start time */
     long long stat_numcommands;     /* Number of processed commands */
     long long stat_numconnections;  /* Number of connections received */
     long long stat_expiredkeys;     /* Number of expired keys */
+    double stat_expired_stale_perc; /* Percentage of keys probably expired */
+    long long stat_expired_time_cap_reached_count; /* Early expire cylce stops.*/
     long long stat_evictedkeys;     /* Number of evicted keys (maxmemory) */
     long long stat_keyspace_hits;   /* Number of successful lookups of keys */
     long long stat_keyspace_misses; /* Number of failed lookups of keys */
@@ -944,6 +976,7 @@ struct redisServer {
     long long stat_active_defrag_misses;    /* number of allocations scanned but not moved */
     long long stat_active_defrag_key_hits;  /* number of keys with moved allocations */
     long long stat_active_defrag_key_misses;/* number of keys scanned and not moved */
+    long long stat_active_defrag_scanned;   /* number of dictEntries scanned */
     size_t stat_peak_memory;        /* Max used memory record */
     long long stat_fork_time;       /* Time needed to perform latest fork() */
     double stat_fork_rate;          /* Fork rate in GB/sec. */
@@ -955,7 +988,7 @@ struct redisServer {
     long long slowlog_entry_id;     /* SLOWLOG current entry ID */
     long long slowlog_log_slower_than; /* SLOWLOG time limit (to get logged) */
     unsigned long slowlog_max_len;     /* SLOWLOG max number of items logged */
-    size_t resident_set_size;       /* RSS sampled in serverCron(). */
+    malloc_stats cron_malloc_stats; /* sampled in serverCron(). */
     long long stat_net_input_bytes; /* Bytes read from network. */
     long long stat_net_output_bytes; /* Bytes written to network. */
     size_t stat_rdb_cow_bytes;      /* Copy on write bytes during RDB saving. */
@@ -979,6 +1012,7 @@ struct redisServer {
     int active_defrag_threshold_upper; /* maximum percentage of fragmentation at which we use maximum effort */
     int active_defrag_cycle_min;       /* minimal effort for defrag in CPU percentage */
     int active_defrag_cycle_max;       /* maximal effort for defrag in CPU percentage */
+    unsigned long active_defrag_max_scan_fields; /* maximum number of fields of set/hash/zset/list to process from within the main dict scan */
     size_t client_max_querybuf_len; /* Limit for client query buffer length */
     int dbnum;                      /* Total number of configured DBs */
     int supervised;                 /* 1 if supervised, 0 otherwise. */
@@ -1118,10 +1152,12 @@ struct redisServer {
     unsigned long long maxmemory;   /* Max number of memory bytes to use */
     int maxmemory_policy;           /* Policy for key eviction */
     int maxmemory_samples;          /* Pricision of random sampling */
-    unsigned int lfu_log_factor;    /* LFU logarithmic counter factor. */
-    unsigned int lfu_decay_time;    /* LFU counter decay factor. */
+    int lfu_log_factor;             /* LFU logarithmic counter factor. */
+    int lfu_decay_time;             /* LFU counter decay factor. */
+    long long proto_max_bulk_len;   /* Protocol bulk length maximum size. */
     /* Blocked clients */
-    unsigned int bpop_blocked_clients; /* Number of clients blocked by lists */
+    unsigned int blocked_clients;   /* # of clients executing a blocking cmd.*/
+    unsigned int blocked_clients_by_type[BLOCKED_NUM];
     list *unblocked_clients; /* list of clients to unblock before next loop */
     list *ready_keys;        /* List of readyList structures for BLPOP & co */
     /* Sort parameters - qsort_r() is only available under BSD so we
@@ -1157,6 +1193,8 @@ struct redisServer {
     int cluster_slave_validity_factor; /* Slave max data age for failover. */
     int cluster_require_full_coverage; /* If true, put the cluster down if
                                           there is at least an uncovered slot.*/
+    int cluster_slave_no_failover;  /* Prevent slave from starting a failover
+                                       if the master is in failure state. */
     char *cluster_announce_ip;  /* IP address to announce on cluster bus. */
     int cluster_announce_port;     /* base port to announce on cluster bus. */
     int cluster_announce_bus_port; /* bus port to announce on cluster bus. */
@@ -1278,6 +1316,8 @@ typedef struct {
     dictEntry *de;
 } hashTypeIterator;
 
+#include "stream.h"  /* Stream data type header file. */
+
 #define OBJ_HASH_KEY 1
 #define OBJ_HASH_VALUE 2
 
@@ -1288,6 +1328,7 @@ typedef struct {
 extern struct redisServer server;
 extern struct sharedObjectsStruct shared;
 extern dictType objectKeyPointerValueDictType;
+extern dictType objectKeyHeapPointerValueDictType;
 extern dictType setDictType;
 extern dictType zsetDictType;
 extern dictType clusterNodesDictType;
@@ -1319,11 +1360,14 @@ void moduleBlockedClientPipeReadable(aeEventLoop *el, int fd, void *privdata, in
 size_t moduleCount(void);
 void moduleAcquireGIL(void);
 void moduleReleaseGIL(void);
+void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid);
+
 
 /* Utils */
 long long ustime(void);
 long long mstime(void);
-void getRandomHexChars(char *p, unsigned int len);
+void getRandomHexChars(char *p, size_t len);
+void getRandomBytes(unsigned char *p, size_t len);
 uint64_t crc64(uint64_t crc, const unsigned char *s, uint64_t l);
 void exitFromChild(int retcode);
 size_t redisPopcount(void *s, long count);
@@ -1357,6 +1401,7 @@ void addReplyDouble(client *c, double d);
 void addReplyHumanLongDouble(client *c, long double d);
 void addReplyLongLong(client *c, long long ll);
 void addReplyMultiBulkLen(client *c, long length);
+void addReplyHelp(client *c, const char **help);
 void copyClientOutputBuffer(client *dst, client *src);
 size_t sdsZmallocSize(sds s);
 size_t getStringObjectSdsUsedMemory(robj *o);
@@ -1385,6 +1430,7 @@ int handleClientsWithPendingWrites(void);
 int clientHasPendingReplies(client *c);
 void unlinkClient(client *c);
 int writeToClient(int fd, client *c, int handler_installed);
+void linkClient(client *c);
 
 #ifdef __GNUC__
 void addReplyErrorFormat(client *c, const char *fmt, ...)
@@ -1410,9 +1456,7 @@ int listTypeEqual(listTypeEntry *entry, robj *o);
 void listTypeDelete(listTypeIterator *iter, listTypeEntry *entry);
 void listTypeConvert(robj *subject, int enc);
 void unblockClientWaitingData(client *c);
-void handleClientsBlockedOnLists(void);
 void popGenericCommand(client *c, int where);
-void signalListAsReady(redisDb *db, robj *key);
 
 /* MULTI/EXEC/WATCH... */
 void unwatchAllKeys(client *c);
@@ -1455,6 +1499,7 @@ robj *createIntsetObject(void);
 robj *createHashObject(void);
 robj *createZsetObject(void);
 robj *createZsetZiplistObject(void);
+robj *createStreamObject(void);
 robj *createModuleObject(moduleType *mt, void *value);
 int getLongFromObjectOrReply(client *c, robj *o, long *target, const char *msg);
 int checkType(client *c, robj *o, int type);
@@ -1598,6 +1643,7 @@ int zslLexValueGteMin(sds value, zlexrangespec *spec);
 int zslLexValueLteMax(sds value, zlexrangespec *spec);
 
 /* Core functions */
+int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *level);
 int freeMemoryIfNeeded(void);
 int processCommand(client *c);
 void setupSignalHandlers(void);
@@ -1754,6 +1800,7 @@ int *evalGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
 int *sortGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
 int *migrateGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
 int *georadiusGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
+int *xreadGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numkeys);
 
 /* Cluster */
 void clusterInit(void);
@@ -1763,6 +1810,7 @@ void clusterCron(void);
 void clusterPropagatePublish(robj *channel, robj *message);
 void migrateCloseTimedoutSockets(void);
 void clusterBeforeSleep(void);
+int clusterSendModuleMessageToTarget(const char *target, uint64_t module_id, uint8_t type, unsigned char *payload, uint32_t len);
 
 /* Sentinel */
 void initSentinelConfig(void);
@@ -1781,6 +1829,7 @@ void scriptingInit(int setup);
 int ldbRemoveChild(pid_t pid);
 void ldbKillForkedSessions(void);
 int ldbPendingChildren(void);
+sds luaCreateFunction(client *c, lua_State *lua, robj *body);
 
 /* Blocked clients */
 void processUnblockedClients(void);
@@ -1789,6 +1838,9 @@ void unblockClient(client *c);
 void replyToBlockedClientTimedOut(client *c);
 int getTimeoutFromObjectOrReply(client *c, robj *object, mstime_t *timeout, int unit);
 void disconnectAllBlockedClients(void);
+void handleClientsBlockedOnKeys(void);
+void signalKeyAsReady(redisDb *db, robj *key);
+void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeout, robj *target, streamID *ids);
 
 /* expire.c -- Handling of expired keys */
 void activeExpireCycle(int type);
@@ -1802,6 +1854,7 @@ void evictionPoolAlloc(void);
 #define LFU_INIT_VAL 5
 unsigned long LFUGetTimeInMinutes(void);
 uint8_t LFULogIncr(uint8_t value);
+unsigned long LFUDecrAndReturn(robj *o);
 
 /* Keys hashing / comparison functions for dict.c hash tables. */
 uint64_t dictSdsHash(const void *key);
@@ -1990,6 +2043,18 @@ void pfdebugCommand(client *c);
 void latencyCommand(client *c);
 void moduleCommand(client *c);
 void securityWarningCommand(client *c);
+void xaddCommand(client *c);
+void xrangeCommand(client *c);
+void xrevrangeCommand(client *c);
+void xlenCommand(client *c);
+void xreadCommand(client *c);
+void xgroupCommand(client *c);
+void xackCommand(client *c);
+void xpendingCommand(client *c);
+void xclaimCommand(client *c);
+void xinfoCommand(client *c);
+void xdelCommand(client *c);
+void xtrimCommand(client *c);
 
 #if defined(__GNUC__)
 void *calloc(size_t count, size_t size) __attribute__ ((deprecated));

@@ -1,5 +1,10 @@
-/*
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+/* Listpack -- A lists of strings serialization format
+ *
+ * This file implements the specification you can find at:
+ *
+ *  https://github.com/antirez/listpack
+ *
+ * Copyright (c) 2017, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,33 +32,30 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef __REDIS_UTIL_H
-#define __REDIS_UTIL_H
+#ifndef __LISTPACK_H
+#define __LISTPACK_H
 
 #include <stdint.h>
-#include "sds.h"
 
-/* The maximum number of characters needed to represent a long double
- * as a string (long double has a huge range).
- * This should be the size of the buffer given to ld2string */
-#define MAX_LONG_DOUBLE_CHARS 5*1024
+#define LP_INTBUF_SIZE 21 /* 20 digits of -2^63 + 1 null term = 21. */
 
-int stringmatchlen(const char *p, int plen, const char *s, int slen, int nocase);
-int stringmatch(const char *p, const char *s, int nocase);
-long long memtoll(const char *p, int *err);
-uint32_t digits10(uint64_t v);
-uint32_t sdigits10(int64_t v);
-int ll2string(char *s, size_t len, long long value);
-int string2ll(const char *s, size_t slen, long long *value);
-int string2l(const char *s, size_t slen, long *value);
-int string2ld(const char *s, size_t slen, long double *dp);
-int d2string(char *buf, size_t len, double value);
-int ld2string(char *buf, size_t len, long double value, int humanfriendly);
-sds getAbsolutePath(char *filename);
-int pathIsBaseName(char *path);
+/* lpInsert() where argument possible values: */
+#define LP_BEFORE 0
+#define LP_AFTER 1
+#define LP_REPLACE 2
 
-#ifdef REDIS_TEST
-int utilTest(int argc, char **argv);
-#endif
+unsigned char *lpNew(void);
+void lpFree(unsigned char *lp);
+unsigned char *lpInsert(unsigned char *lp, unsigned char *ele, uint32_t size, unsigned char *p, int where, unsigned char **newp);
+unsigned char *lpAppend(unsigned char *lp, unsigned char *ele, uint32_t size);
+unsigned char *lpDelete(unsigned char *lp, unsigned char *p, unsigned char **newp);
+uint32_t lpLength(unsigned char *lp);
+unsigned char *lpGet(unsigned char *p, int64_t *count, unsigned char *intbuf);
+unsigned char *lpFirst(unsigned char *lp);
+unsigned char *lpLast(unsigned char *lp);
+unsigned char *lpNext(unsigned char *lp, unsigned char *p);
+unsigned char *lpPrev(unsigned char *lp, unsigned char *p);
+uint32_t lpBytes(unsigned char *lp);
+unsigned char *lpSeek(unsigned char *lp, long index);
 
 #endif

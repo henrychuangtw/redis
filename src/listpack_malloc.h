@@ -1,5 +1,7 @@
-/*
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+/* Listpack -- A lists of strings serialization format
+ * https://github.com/antirez/listpack
+ *
+ * Copyright (c) 2017, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,33 +29,17 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef __REDIS_UTIL_H
-#define __REDIS_UTIL_H
+/* Allocator selection.
+ *
+ * This file is used in order to change the Rax allocator at compile time.
+ * Just define the following defines to what you want to use. Also add
+ * the include of your alternate allocator if needed (not needed in order
+ * to use the default libc allocator). */
 
-#include <stdint.h>
-#include "sds.h"
-
-/* The maximum number of characters needed to represent a long double
- * as a string (long double has a huge range).
- * This should be the size of the buffer given to ld2string */
-#define MAX_LONG_DOUBLE_CHARS 5*1024
-
-int stringmatchlen(const char *p, int plen, const char *s, int slen, int nocase);
-int stringmatch(const char *p, const char *s, int nocase);
-long long memtoll(const char *p, int *err);
-uint32_t digits10(uint64_t v);
-uint32_t sdigits10(int64_t v);
-int ll2string(char *s, size_t len, long long value);
-int string2ll(const char *s, size_t slen, long long *value);
-int string2l(const char *s, size_t slen, long *value);
-int string2ld(const char *s, size_t slen, long double *dp);
-int d2string(char *buf, size_t len, double value);
-int ld2string(char *buf, size_t len, long double value, int humanfriendly);
-sds getAbsolutePath(char *filename);
-int pathIsBaseName(char *path);
-
-#ifdef REDIS_TEST
-int utilTest(int argc, char **argv);
-#endif
-
+#ifndef LISTPACK_ALLOC_H
+#define LISTPACK_ALLOC_H
+#include "zmalloc.h"
+#define lp_malloc zmalloc
+#define lp_realloc zrealloc
+#define lp_free zfree
 #endif
